@@ -12,6 +12,5 @@ class Linear_ac(nn.Module):
         self.para = nn.Parameter(torch.rand([1,self.ip_dim]))
 
     def forward(self, ip: torch.Tensor):
-        """w = torch.softmax(self.para,dim=-1)
-        return (ip*w).sum(dim=-1).unsqueeze(-1)"""
-        return ip[:,0].unsqueeze(-1)
+        w = torch.softmax(self.para, dim=-1)
+        return (ip * w).sum(dim=-1).unsqueeze(-1)

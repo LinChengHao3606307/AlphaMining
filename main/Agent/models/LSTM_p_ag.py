@@ -56,7 +56,7 @@ class LSTM_p_ag(nn.Module):
             formula_profile_length: int = DefaultValues.formula_profile_length,
             lstm_hidden_size: int = 128,
             lstm_num_layers:int = 3,
-            save_path:str = DefaultValues.model_state_dict_path + "LSTM_p_ag"
+            save_path:str = os.path.join(DefaultValues.model_state_dict_path,"LSTM_p_ag")
 
     ):
         self.save_path = save_path

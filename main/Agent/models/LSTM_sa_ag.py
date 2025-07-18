@@ -65,7 +65,7 @@ class LSTM_sa_ag(nn.Module):
             lstm_num_layers:int = 3,
             enco_nhead:int = 8,
             enco_num_layers:int = 2,
-            save_path:str = DefaultValues.model_state_dict_path + "LSTM_sa_ag"
+            save_path:str = os.path.join(DefaultValues.model_state_dict_path,"LSTM_sa_ag")
 
     ):
         assert lstm_hidden_and_econ_dim%enco_nhead == 0

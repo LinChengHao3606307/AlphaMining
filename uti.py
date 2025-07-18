@@ -101,3 +101,38 @@ def get_callable_kwargs(config: Union[Dict, str], default_module: Union[str, Mod
     else:
         raise NotImplementedError(f"This type of input is not supported")
     return _callable, kwargs
+
+
+def dynamic_import_and_instantiate(config: dict):
+    """
+    动态导入并实例化类
+    
+    Args:
+        config: 包含class, module_path, kwargs的字典
+    
+    Returns:
+        实例化的对象
+    """
+    try:
+        # 动态导入模块
+        module = importlib.import_module(config["module_path"])
+        # 获取类
+        class_obj = getattr(module, config["class"])
+        
+        # 处理嵌套的kwargs
+        kwargs = config.get("kwargs", {})
+        processed_kwargs = {}
+        
+        for key, value in kwargs.items():
+            if isinstance(value, dict) and "class" in value and "module_path" in value:
+                # 这是一个嵌套的配置对象，需要递归实例化
+                processed_kwargs[key] = dynamic_import_and_instantiate(value)
+            else:
+                processed_kwargs[key] = value
+        
+        # 实例化
+        instance = class_obj(**processed_kwargs)
+        return instance
+    except Exception as e:
+        print(f"动态导入失败: {e}")
+        raise

@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 
-from others.alpha_mining import DefaultValues
+from __init__ import DefaultValues
 import torch.nn.functional as F
 assert DefaultValues.fn_profile_length == 7
 
@@ -22,7 +22,7 @@ class LSTM_ps_ag(nn.Module):
             lstm_num_layers:int = 1,
             summarizer_lstm_num_layers: int = 4,
             enco_nhead:int=8,
-            save_path:str = DefaultValues.model_state_dict_path + "LSTM_ps_ag"
+            save_path:str = os.path.join(DefaultValues.model_state_dict_path, "LSTM_ps_ag")
 
     ):
         self.save_path = save_path

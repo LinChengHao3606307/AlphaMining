@@ -32,17 +32,17 @@ class AutoMaskTransformerEncoder(nn.Module):
             dim_feedforward=dim_feedforward,
             dropout=dropout,
             batch_first=True
-        )
+        ).to(DefaultValues.device)
 
         # 使用自定义的 Transformer 编码器
         self.transformer_encoder = nn.TransformerEncoder(
             encoder_layer,
             num_layers=num_layers
-        )
+        ).to(DefaultValues.device)
         self.causal_mask = torch.triu(
             torch.ones(seq_length, seq_length) * float('-inf'),
             diagonal=0
-        ).unsqueeze(0)
+        ).unsqueeze(0).to(DefaultValues.device)
 
     def forward(self, src, mask):
         """
@@ -59,12 +59,14 @@ class AutoMaskTransformerEncoder(nn.Module):
         # 创建可被注意到的位置mask
         # 首先扩展mask到 [batch_size, seq_length, seq_length]
         # 使得对于每个query位置t，只有mask值为1的key位置n可以被注意到
+
         expanded_mask = mask.unsqueeze(1).expand(-1, seq_length, -1)
 
         # 结合因果mask和输入mask
         # 对于位置t，只有n < t且mask[n] == 1的位置可以被注意到
-        combined_mask = self.causal_mask.expand(batch_size, -1, -1) + (1.0 - expanded_mask) * float('-inf')
-
+        combined_mask = self.causal_mask.expand(batch_size, -1, -1)
+        combined_mask = combined_mask.masked_fill(expanded_mask == 0, float('-inf'))
+        combined_mask = combined_mask.unsqueeze(1).expand(-1, self.nhead, -1, -1).reshape(batch_size* self.nhead, seq_length, seq_length)
         # 通过Transformer编码器处理
         output = self.transformer_encoder(
             src,
@@ -82,7 +84,7 @@ class ENCO_ca_ag(nn.Module):
             d_model: int = 128,
             num_layers:int = 2,
             nhead:int = 8,
-            save_path:str = DefaultValues.model_state_dict_path + "ENCO_ca_ag"
+            save_path:str = os.path.join(DefaultValues.model_state_dict_path,"ENCO_ca_ag")
 
     ):
         assert d_model % nhead == 0
@@ -198,10 +200,9 @@ class ENCO_ca_ag(nn.Module):
 
 
     def forward(self, input_state: torch.Tensor):
-        op_mask = input_state[:,:,0] * float('-inf')
         mask = input_state[:,:,1]
         fn_type = input_state[:,:,2]
-        fn_time_para = input_state[:,:,3:]
+        fn_time_para = input_state[:,:,3:].float()
         input_seq = self.positional_ebd.expand([input_state.shape[0],-1,-1]) + \
                     F.normalize(self.embedding(fn_type) + self.time_para_fc(fn_time_para),dim=-1)
         input_seq = torch.cat([
@@ -211,14 +212,22 @@ class ENCO_ca_ag(nn.Module):
         x = input_seq
         for i in range(self.log_seq_len):
             current_seq_len = 2**(self.log_seq_len-i)
-            x = input_seq[:, current_seq_len:, :] + self.transformer_encoders[i](
-                x[:, current_seq_len:, :], mask[:, current_seq_len:]
+            
+            ecd_re = self.transformer_encoders[i](
+                x[:, -current_seq_len:, :], mask[:, -current_seq_len:]
             )
+            x = input_seq[:, -current_seq_len:, :] + ecd_re
         out = x[:, -1, :]
         fn_types_probs = F.softmax(self.fn_types_output(out), dim=-1)
-
-        ip_idx1_probs = self.ip1_idx_fc(out) + op_mask
-        ip_idx2_probs = self.ip2_idx_fc(out) + op_mask
+        
+        #print("--------------------------------")
+        masked_idx1 = self.ip1_idx_fc(out).masked_fill(input_state[:,-self.ip_idx_dim:,0] == 0, float('-inf'))
+        ip_idx1_probs = F.softmax(masked_idx1, dim=-1)
+        #print(ip_idx1_probs)
+        masked_idx2 = self.ip2_idx_fc(out).masked_fill(input_state[:,-self.ip_idx_dim:,0] == 0, float('-inf'))
+        ip_idx2_probs = F.softmax(masked_idx2, dim=-1)
+        #print(ip_idx2_probs)
+        #print("--------------------------------")
 
         fn_para_mean = torch.round(
             torch.log(

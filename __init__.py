@@ -21,7 +21,11 @@ class DefaultValues:
     buf_formula_shape = (formula_profile_length,
                          fn_profile_length)
     tpv_formula_shape = (2 ** (formula_profile_length+1),
-                         (fn_profile_length-1)//2 + 1 + 1)
+                         5) # output_mask, valid_pos_mask, fn_type, fn_time_shift, fn_time_span
+    pse_formula_shape = (formula_profile_length,  # 公式数量
+                         (2 * formula_profile_length + 1) + 1, # (2 * formula_profile_length + 1) = 树节点的最大值
+                         4) # <tree_pos, fn_type, fn_time_shift, fn_time_span>
+    fn_time_para_scale = 10
     device = "cuda"
     project_root_path = os.path.dirname(__file__)
     model_state_dict_path = os.path.join(project_root_path, "main", "Agent", "models_state_dict")
@@ -33,22 +37,91 @@ import numpy as np
 
 
 class Formula:
-    def __init__(self, std_formula=None, sfn_formula=None, buf_formula=None):
+    """
+    公式类，支持三种不同的数据格式：
+    
+    1. std_formula (标准格式):
+       格式: numpy.ndarray, shape=(n, 7), dtype=int32
+       每行包含: [type_idx, input1_idx, time_shift1, time_span1, input2_idx, time_shift2, time_span2]
+       - type_idx: 函数类型索引 (0-23)
+       - input1_idx: 第一个输入的位置索引 (可以是负数表示因子，正数表示公式位置)
+       - time_shift1: 第一个输入的时间偏移 (≤0)
+       - time_span1: 第一个输入的时间跨度 (≥1)
+       - input2_idx: 第二个输入的位置索引 (仅双输入函数使用)
+       - time_shift2: 第二个输入的时间偏移 (≤0)
+       - time_span2: 第二个输入的时间跨度 (≥1)
+       
+    2. buf_formula (缓冲区格式):
+       格式: numpy.ndarray, shape=(5, 7), dtype=int32
+       用于模型输入的固定长度格式，包含：
+       - 有效公式数据 + dummy填充
+       - 数值已转换：type_idx+1, input_idx+31, time_shift取反, time_span-1
+       - dummy行：type_idx=9, input_idx=pos-1, time_shift=0, time_span=1
+       
+    3. sfn_formula (单函数数值区分型):
+       格式: list of dict, 每个dict包含：
+       - 'discrete': [type_idx+1, input1_idx+31, input2_idx+31]
+       - 'continuous': [-time_shift1, time_span1-1, -time_shift2, time_span2-1]
+       
+    4. tpv_formula (树位置向量格式):
+       格式: numpy.ndarray, shape=(32, 5), dtype=int32
+       用于Transformer模型的序列化表示：
+       - 第0列: 填充掩码 (1表示填充)
+       - 第1列: 有效掩码 (1表示有效)
+       - 第2列: 函数类型 (1-31为因子, 32-55为函数)
+       - 第3列: 时间偏移
+       - 第4列: 时间跨度
+    """
+    def __init__(self, std_formula=None, sfn_formula=None, buf_formula=None, tpv_formula=None):
 
         self.std_formula = np.zeros((0, DefaultValues.fn_profile_length), dtype=np.int32)
         self.sfn_formula = []
         self.buf_formula = np.zeros( DefaultValues.buf_formula_shape, dtype=np.int32 )
         self.tpv_formula = np.zeros( DefaultValues.tpv_formula_shape, dtype=np.int32 )
+        self.pse_formula = np.zeros( DefaultValues.pse_formula_shape, dtype=np.int32 )
+        self.tpv_len = DefaultValues.tpv_formula_shape[0]
         self.num_of_dummy = None
-
         if not std_formula is None:
             self.std_formula = std_formula
         if not  sfn_formula is None:
             self.set_sfn(sfn_formula)
         elif not buf_formula is None:
             self.set_buf(buf_formula)
+        elif not tpv_formula is None:
+            self.set_tpv(buf_formula)
         else:
             self.set_std(self.std_formula)
+
+    def get(self,type:str, want_size=False):
+
+        if type == "buf":
+            if not want_size:
+                return self.buf_formula
+            else:
+                return DefaultValues.buf_formula_shape
+        if type == "tpv":
+            if not want_size:
+                return self.tpv_formula
+            else:
+                return DefaultValues.tpv_formula_shape
+        if type == "pse":
+            if not want_size:
+                return self.pse_formula
+            else:
+                return DefaultValues.pse_formula_shape
+        raise NotImplementedError(type + " is not implemented")
+
+    def get_reward_projection_chain(self):
+        i = self.std_formula.shape[0] - 1
+        if i<0:
+            return np.array([0, 0])
+        ty, i1, tf1, ts1, i2, tf2, ts2 = self.std_formula[i]
+        if i1<0:
+            i1 = i
+        if i2<0 or ( not (ty in DefaultValues.fn_of_2_ip)):
+            i2 = i
+        return np.array([i1-i, i2-i])
+
     def show(self,idx:list[int]=None):
         print("*===    " * 7)
         i = idx
@@ -59,6 +132,7 @@ class Formula:
                 print(num,end="\t\t")
             print()
         print("*===    " * 7)
+
 
     def _std_vali_check(self):
         """批量验证标准格式的合法性"""
@@ -85,13 +159,6 @@ class Formula:
         assert np.all(valid_i1 & valid_i2)
 
         # 验证引用顺序 (i1 < current_idx, i2 < current_idx)
-        """print("= "*40)
-        print("i1:")
-        print(i1)
-        print("i2:")
-        print(i2)
-        print("check with>>")
-        print(idx_matrix)"""
         assert np.all((i1 < idx_matrix) & (i2 < idx_matrix))
 
         # 验证时间参数
@@ -112,6 +179,7 @@ class Formula:
         self._to_sfn()
         self._to_buf()
         self._to_tpv()
+        self._to_pse()
 
     def append_buf_fn(self, new_fn):
         """追加buffer格式函数"""
@@ -125,30 +193,92 @@ class Formula:
         self._std_vali_check()
         self._to_sfn()
         self._to_tpv()
+        self._to_pse()
 
     def append_sfn_fn(self, new_fn):
         """追加单fn数值区分型函数"""
         if len(self.sfn_formula) >= DefaultValues.formula_profile_length:
             raise ValueError(f"Cannot exceed max formula length {DefaultValues.formula_profile_length}")
 
-        self.sfn_formula.append(new_fn)
+        self.sfn_formula.append({
+            'discrete': new_fn['discrete'],
+            'continuous': new_fn['continuous']
+        })
         self._from_sfn()
         self._std_vali_check()
         self._to_buf()
         self._to_tpv()
+        self._to_pse()
 
-    def _handle_tpv_from_std_at(self, current_std_idx:int, current_tp:int, current_abs_root_time_shift:int, current_time_span:int):
+    def _handle_pse_from_std_at(self, current_std_idx:int, current_tp:int, current_abs_root_time_shift:int, current_time_span:int, level:int):
         if current_std_idx<0:
-            self.tpv_formula[current_tp][1] = 1  # valid mask
-            self.tpv_formula[current_tp][2] = DefaultValues.total_amount_of_factors - current_std_idx  # fn type
-            self.tpv_formula[current_tp][3] = 0  # time shift
-            self.tpv_formula[current_tp][4] = 0  # time span
+
+            self.pse_formula[level, self.tail_idx, 0] = current_tp-1  # tree pos
+            self.pse_formula[level, self.tail_idx, 1] = DefaultValues.total_amount_of_factors + current_std_idx  # fn type
+            self.pse_formula[level, self.tail_idx, 2] = 0  # time shift
+            self.pse_formula[level, self.tail_idx, 3] = 0  # time span
+            self.tail_idx += 1
             return
         ty, i1, tf1, ts1, i2, tf2, ts2 = self.std_formula[current_std_idx]
-        self.tpv_formula[current_tp][1] = 1 # valid mask
-        self.tpv_formula[current_tp][2] = ty + 1 + DefaultValues.total_amount_of_factors # fn type
-        self.tpv_formula[current_tp][3] = -current_abs_root_time_shift # time shift
-        self.tpv_formula[current_tp][4] = current_time_span - 1 # time span
+
+        self.pse_formula[level, self.tail_idx, 0] = current_tp-1 # tree pos
+        self.pse_formula[level, self.tail_idx, 1] = ty + 1 + DefaultValues.total_amount_of_factors # fn type
+        self.pse_formula[level, self.tail_idx, 2] = -current_abs_root_time_shift  # time shift
+        self.pse_formula[level, self.tail_idx, 3] = current_time_span - 1  # time span
+        self.tail_idx += 1
+        self._handle_pse_from_std_at(i1, current_tp * 2, current_abs_root_time_shift + tf1, ts1, level)
+        if ty in DefaultValues.fn_of_2_ip:
+            self._handle_pse_from_std_at(i2, current_tp * 2 + 1, current_abs_root_time_shift + tf2, ts2, level)
+
+    def _to_pse(self):
+        self.pse_formula *= 0
+        self.tail_idx = 0
+        length = self.std_formula.shape[0]
+        for i in range(length):
+            self.tail_idx = 1
+            self._handle_pse_from_std_at(i, 1, 0, 1, i)
+            m, p = self.pse_formula[i, 1:self.tail_idx, :], self.pse_formula[i, self.tail_idx:, :]
+            self.pse_formula[i, 1:, :] = np.concatenate((m[::-1,:],p), axis=0)
+            self.pse_formula[i, 0, :] = self.tail_idx - 1
+        del self.tail_idx
+
+    def _handle_std_from_pse_at(self, prev_abs_root_time_shift:int):
+        current_pos = self.tail_idx
+        if self.pse_formula[current_pos][0] == 0:
+            return (-1, 0, 1)
+        self.tail_idx += 1
+        ty, current_abs_shift, current_span = self.pse_formula[current_pos][-3:]
+        ty -= DefaultValues.total_amount_of_factors
+        if ty < 0:
+            return (ty, prev_abs_root_time_shift - current_abs_shift, current_span)
+        ty -= 1
+        i1, tf1, ts1 = self._handle_std_from_pse_at(current_abs_shift)
+        i2, tf2, ts2 = self._handle_std_from_pse_at(current_abs_shift)
+        std_pos = self.std_formula.shape[0]-current_pos-1
+        self.std_formula[std_pos] = np.array([ty, i1, tf1, ts1, i2, tf2, ts2])
+        return (std_pos, prev_abs_root_time_shift - current_abs_shift, current_span+1)
+
+    def _from_pse(self):
+        assert False
+        length = sum(np.maximum(self.pse_formula[:,0], 0))
+        self.std_formula = np.zeros([length,DefaultValues.fn_profile_length])
+        self._handle_std_from_pse_at(0)
+        self.tail_idx = 0
+        del self.tail_idx
+
+    def _handle_tpv_from_std_at(self, current_std_idx:int, current_tp:int, current_abs_root_time_shift:int, current_time_span:int):
+        reverse_tp = -current_tp-1
+        if current_std_idx < 0:
+            self.tpv_formula[reverse_tp][1] = 1  # valid mask
+            self.tpv_formula[reverse_tp][2] = DefaultValues.total_amount_of_factors + current_std_idx  # fn type
+            self.tpv_formula[reverse_tp][3] = 0  # time shift
+            self.tpv_formula[reverse_tp][4] = 0  # time span
+            return
+        ty, i1, tf1, ts1, i2, tf2, ts2 = self.std_formula[current_std_idx]
+        self.tpv_formula[reverse_tp][1] = 1 # valid mask
+        self.tpv_formula[reverse_tp][2] = ty + 1 + DefaultValues.total_amount_of_factors # fn type
+        self.tpv_formula[reverse_tp][3] = -current_abs_root_time_shift # time shift
+        self.tpv_formula[reverse_tp][4] = current_time_span - 1 # time span
         self._handle_tpv_from_std_at(i1, current_tp * 2, current_abs_root_time_shift + tf1, ts1)
         if ty in DefaultValues.fn_of_2_ip:
             self._handle_tpv_from_std_at(i2, current_tp * 2 + 1, current_abs_root_time_shift + tf2, ts2)
@@ -156,25 +286,29 @@ class Formula:
     def _to_tpv(self):
         """标准格式 -> 树位置向量"""
         self.tpv_formula *= 0
-        self.tpv_formula[-(DefaultValues.formula_profile_length - self.std_formula.shape[0]):, 0] = 1
+        dfl = DefaultValues.formula_profile_length
+        self.tpv_formula[:self.tpv_len - dfl + self.std_formula.shape[0], 0] = 1
         self._handle_tpv_from_std_at(self.std_formula.shape[0]-1, 1, 0, 1)
 
     def _handle_std_from_tpv_at(self, current_std_idx:int, current_tp:int,prev_abs_root_time_shift:int):
-        if self.tpv_formula[current_tp][1] == 0:
+        reverse_tp = -current_tp - 1
+        if self.tpv_formula[reverse_tp][1] == 0:
             return (-1, 0, 1) # dummy
-        ty = self.tpv_formula[current_tp][2] - DefaultValues.total_amount_of_factors
+        ty = self.tpv_formula[reverse_tp][2] - DefaultValues.total_amount_of_factors
+        this_abs_shift = self.tpv_formula[reverse_tp][3]
         if ty < 0:
-            return (-ty, 0, 1) # factor getter
-        ty += 1
+            return (-ty, prev_abs_root_time_shift - this_abs_shift, 1) # factor getter
+        ty -= 1
         self.tail_idx -= 1
-        this_abs_shift = self.tpv_formula[current_tp][3]
-        i1, tf1, ts1 = self._handle_tpv_from_std_at(self.tail_idx, 2*current_tp  , this_abs_shift)
-        i2, tf2, ts2 = self._handle_tpv_from_std_at(self.tail_idx, 2*current_tp+1, this_abs_shift)
+        i1, tf1, ts1 = self._handle_std_from_tpv_at(self.tail_idx, 2*current_tp  , this_abs_shift)
+        i2, tf2, ts2 = self._handle_std_from_tpv_at(self.tail_idx, 2*current_tp+1, this_abs_shift)
         self.std_formula[current_std_idx] = np.array([ty, i1, tf1, ts1, i2, tf2, ts2])
-        return (current_std_idx, prev_abs_root_time_shift - this_abs_shift, self.tpv_formula[current_tp][4]+1)
+        return (current_std_idx, prev_abs_root_time_shift - this_abs_shift, self.tpv_formula[reverse_tp][4]+1)
 
     def _from_tpv(self):
-        length = DefaultValues.formula_profile_length - sum(self.tpv_formula[:,0])
+        assert False
+        length = sum(self.tpv_formula[:,0]) - DefaultValues.total_amount_of_factors
+        self.tail_idx = length-1
         self.std_formula = np.zeros([length, DefaultValues.fn_profile_length])
         self._handle_std_from_tpv_at(self.tail_idx, 1, 0)
         del self.tail_idx
@@ -294,6 +428,7 @@ class Formula:
         self._to_sfn()
         self._to_buf()
         self._to_tpv()
+        self._to_pse()
 
     def set_buf(self, arr:torch.Tensor):
         if type(arr) == torch.Tensor:
@@ -303,6 +438,7 @@ class Formula:
         self._std_vali_check()
         self._to_sfn()
         self._to_tpv()
+        self._to_pse()
 
     def set_sfn(self, sfn):
         self.sfn_formula = sfn
@@ -310,6 +446,22 @@ class Formula:
         self._std_vali_check()
         self._to_buf()
         self._to_tpv()
+        self._to_pse()
+
+    def set_tpv(self, tpv):
+        self.tpv_formula = tpv
+        self._from_tpv()
+        self._std_vali_check()
+        self._to_buf()
+        self._to_sfn()
+        self._to_tpv()
+
+    def set_pse(self, pse):
+        self.pse_formula = pse
+        self._from_pse()
+        self._std_vali_check()
+        self._to_buf()
+        self._to_sfn()
 
     def __len__(self):
         return len(self.sfn_formula)
@@ -335,109 +487,3 @@ class Formula:
 
 
 
-
-import contextlib
-import importlib
-import os
-from pathlib import Path
-import pickle
-import pkgutil
-import re
-import sys
-from types import ModuleType
-from typing import Any, Dict, List, Tuple, Union
-
-
-
-def get_module_by_module_path(module_path: Union[str, ModuleType]):
-    """Load module path
-
-    :param module_path:
-    :return:
-    :raises: ModuleNotFoundError
-    """
-    if module_path is None:
-        raise ModuleNotFoundError("None is passed in as parameters as module_path")
-
-    if isinstance(module_path, ModuleType):
-        module = module_path
-    else:
-        if module_path.endswith(".py"):
-            module_name = re.sub("^[^a-zA-Z_]+", "", re.sub("[^0-9a-zA-Z_]", "", module_path[:-3].replace("/", "_")))
-            module_spec = importlib.util.spec_from_file_location(module_name, module_path)
-            module = importlib.util.module_from_spec(module_spec)
-            sys.modules[module_name] = module
-            module_spec.loader.exec_module(module)
-        else:
-            module = importlib.import_module(module_path)
-    return module
-
-
-def split_module_path(module_path: str) -> Tuple[str, str]:
-    """
-
-    Parameters
-    ----------
-    module_path : str
-        e.g. "a.b.c.ClassName"
-
-    Returns
-    -------
-    Tuple[str, str]
-        e.g. ("a.b.c", "ClassName")
-    """
-    *m_path, cls = module_path.split(".")
-    m_path = ".".join(m_path)
-    return m_path, cls
-
-
-def get_callable_kwargs(config: Dict, default_module: Union[str, ModuleType] = None) -> (type, Dict):
-    """
-    extract class/func and kwargs from config info
-
-    Parameters
-    ----------
-    config : [dict, str]
-        similar to config
-        please refer to the doc of init_instance_by_config
-
-    default_module : Python module or str
-        It should be a python module to load the class type
-        This function will load class from the config['module_path'] first.
-        If config['module_path'] doesn't exists, it will load the class from default_module.
-
-    Returns
-    -------
-    (type, dict):
-        the class/func object and it's arguments.
-
-    Raises
-    ------
-        ModuleNotFoundError
-    """
-    if isinstance(config, dict):
-        key = "class" if "class" in config else "func"
-        if isinstance(config[key], str):
-            # 1) get module and class
-            # - case 1): "a.b.c.ClassName"
-            # - case 2): {"class": "ClassName", "module_path": "a.b.c"}
-            m_path, cls = split_module_path(config[key])
-            if m_path == "":
-                m_path = config.get("module_path", default_module)
-            module = get_module_by_module_path(m_path)
-
-            # 2) get callable
-            _callable = getattr(module, cls)  # may raise AttributeError
-        else:
-            _callable = config[key]  # the class type itself is passed in
-        kwargs = config.get("kwargs", {})
-    elif isinstance(config, str):
-        # a.b.c.ClassName
-        m_path, cls = split_module_path(config)
-        module = get_module_by_module_path(default_module if m_path == "" else m_path)
-
-        _callable = getattr(module, cls)
-        kwargs = {}
-    else:
-        raise NotImplementedError(f"This type of input is not supported")
-    return _callable, kwargs
